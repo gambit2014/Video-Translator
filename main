@@ -1,0 +1,241 @@
+import os
+
+###############################################################################
+# 1) Set environment variables *before* importing faster-whisper or torch
+###############################################################################
+os.environ["OMP_NUM_THREADS"] = "20"        # Let OpenMP use up to 24 threads
+os.environ["OMP_THREAD_LIMIT"] = "20"       # Sometimes needed to enforce the limit
+# If your build uses MKL or another BLAS library, you can also set:
+# os.environ["MKL_NUM_THREADS"] = "24"
+
+########################################################################
+# 2) Import the rest of your libraries
+#########################################################################
+import ffmpeg
+from faster_whisper import WhisperModel
+from transformers import MarianMTModel, MarianTokenizer
+from gtts import gTTS
+import tempfile
+import torch
+import os
+
+def chunk_text(text, max_tokens=400):
+    """
+    Split text into chunks of max_tokens words to avoid
+    exceeding the model's token limit.
+    """
+    words = text.split()
+    for i in range(0, len(words), max_tokens):
+        yield " ".join(words[i:i + max_tokens])
+
+class VideoTranslator:
+    def __init__(self):
+        # Determine device availability
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {self.device}")
+
+        # Initialize models
+        print("Loading models...")
+
+        ##########################################################################
+        # 3) Pass num_workers to WhisperModel to allow multi-threaded CPU inference
+        #    If you're on CPU, also consider compute_type="int8_float16" or "int8"
+        #    for speed. We keep float32 for maximum quality.
+        ###########################################################################
+        self.whisper_model = WhisperModel(
+            "medium",
+            device=self.device,
+            compute_type="float32",  # or "int8_float16"/"int8" for faster, lower-memory CPU inference
+            num_workers=20           # match your CPU threads
+        )
+
+        self.translation_model_name = "Helsinki-NLP/opus-mt-de-en"
+        self.tokenizer = MarianTokenizer.from_pretrained(self.translation_model_name)
+        self.translation_model = MarianMTModel.from_pretrained(self.translation_model_name)
+
+        if self.device == "cuda":
+            self.translation_model = self.translation_model.to("cuda")
+
+        #  G:\output folder  (on Windows).
+        self.output_directory = r"G:\output"
+        os.makedirs(self.output_directory, exist_ok=True)
+
+    def extract_audio(self, video_path, audio_output):
+        """
+        Extracts audio from the given video_path and saves it as PCM WAV
+        with a 16 kHz sample rate in audio_output.
+        """
+        try:
+            print("Extracting audio...")
+            stream = ffmpeg.input(video_path)
+            stream = ffmpeg.output(stream, audio_output, acodec='pcm_s16le', ar='16000')
+            ffmpeg.run(stream, overwrite_output=True)
+            return True
+        except ffmpeg.Error as e:
+            print(f"Error extracting audio: {e.stderr.decode()}")
+            return False
+
+    def transcribe_audio(self, audio_path, language="de"):
+        """
+        Uses Faster Whisper to transcribe audio from audio_path in the
+        specified language.
+        """
+        try:
+            print("Transcribing audio...")
+            segments, info = self.whisper_model.transcribe(audio_path, language=language)
+            transcript = " ".join(segment.text for segment in segments)
+            return transcript
+        except Exception as e:
+            print(f"Error during transcription: {str(e)}")
+            return None
+
+    def translate_text(self, text):
+        """
+        Translates the given text from German to English using MarianMT.
+        Splits long text into chunks to avoid token length limits.
+        """
+        try:
+            print("Translating text...")
+            translated_chunks = []
+
+            for chunk in chunk_text(text):
+                inputs = self.tokenizer(
+                    chunk,
+                    return_tensors="pt",
+                    padding=True,
+                    max_length=512,
+                    truncation=True
+                )
+                if self.device == "cuda":
+                    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+                translated = self.translation_model.generate(**inputs)
+                translated_text = self.tokenizer.decode(translated[0], skip_special_tokens=True)
+                translated_chunks.append(translated_text)
+
+            return " ".join(translated_chunks)
+        except Exception as e:
+            print(f"Error during translation: {str(e)}")
+            return None
+
+    def generate_speech(self, text, output_audio, lang="en"):
+        """
+        Generates speech from the provided text and saves to output_audio
+        using gTTS. Default language is English.
+        """
+        try:
+            print("Generating speech...")
+            tts = gTTS(text=text, lang=lang)
+            tts.save(output_audio)
+            return True
+        except Exception as e:
+            print(f"Error generating speech: {str(e)}")
+            return False
+
+    def merge_audio_video(self, video_input, audio_input, output_video):
+        """
+        Merges the newly generated audio (audio_input) with the original
+        video (video_input) and saves to output_video.
+        """
+        try:
+            print("Merging audio with video...")
+            stream = ffmpeg.input(video_input)
+            audio = ffmpeg.input(audio_input)
+
+            stream = ffmpeg.output(
+                stream, audio,
+                output_video,
+                vcodec='copy',
+                acodec='aac',
+                strict='experimental'
+            )
+            ffmpeg.run(stream, overwrite_output=True)
+            return True
+        except ffmpeg.Error as e:
+            print(f"Error merging audio and video: {e.stderr.decode()}")
+            return False
+
+    def process_video(self, video_path):
+        """
+        Coordinates the full video processing:
+         1. Extract audio
+         2. Transcribe text
+         3. Translate text
+         4. Generate speech
+         5. Merge new audio with original video
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = os.path.join(temp_dir, "extracted_audio.wav")
+            translated_audio = os.path.join(temp_dir, "translated_audio.mp3")
+
+            # Save the final output in G:\output with a prefixed name
+            output_filename = "translated_" + os.path.basename(video_path)
+            output_video = os.path.join(self.output_directory, output_filename)
+
+            try:
+                # 1. Extract audio
+                if not self.extract_audio(video_path, audio_path):
+                    return False
+
+                # 2. Transcribe
+                transcript = self.transcribe_audio(audio_path)
+                if not transcript:
+                    return False
+                print(f"Transcribed text: {transcript}")
+
+                # 3. Translate
+                translated_text = self.translate_text(transcript)
+                if not translated_text:
+                    return False
+                print(f"Translated text: {translated_text}")
+
+                # 4. Generate speech
+                if not self.generate_speech(translated_text, translated_audio, lang="en"):
+                    return False
+
+                # 5. Merge audio & video
+                if not self.merge_audio_video(video_path, translated_audio, output_video):
+                    return False
+
+                print(f"Translation complete! Output saved as: {output_video}")
+                return True
+
+            except ffmpeg.Error as fe:
+                print(f"FFmpeg error: {fe.stderr.decode()}")
+                return False
+            except (OSError, IOError) as file_error:
+                print(f"File error: {str(file_error)}")
+                return False
+            except Exception as e:
+                print(f"Unexpected error: {str(e)}")
+                return False
+
+def main():
+    print("Video Translator")
+    print("-" * 50)
+
+    # Create an instance of VideoTranslator
+    translator = VideoTranslator()
+
+    while True:
+        video_path = input("\nEnter the path to your video file (or 'q' to quit): ").strip()
+
+        if video_path.lower() == 'q':
+            break
+
+        if not os.path.exists(video_path):
+            print("Error: File does not exist!")
+            continue
+
+        print("\nProcessing video...")
+        success = translator.process_video(video_path)
+
+        if success:
+            print("\nProcessing completed successfully!")
+        else:
+            print("\nProcessing failed!")
+
+        print("\nReady for next video...")
+
+if __name__ == "__main__":
+    main()
